@@ -1,0 +1,32 @@
+# 학습 관련 설정
+train:
+  learning_rate: 0.01
+  batch_size: 128
+  epochs: 100
+  loss: 'l2'
+  optimizer: 'adam'
+
+# 데이터셋 설정
+data:
+  root: ./data/nerf_synthetic/lego/
+  images_dir: images/
+  colmap_output_dir: colmap_output/
+  resolution: [800, 800]
+
+# Gaussian Splatting 관련
+gaussian:
+  init_method: 'sfm'   # SfM 포인트로 초기화
+  scale_variance: true
+  num_gaussians: 100000
+
+# 렌더링 관련
+render:
+  background: 'black'
+  camera_path: './data/camera_path.json'
+  image_size: [800, 800]
+
+# 체크포인트 및 로그 설정
+logging:
+  output_dir: ./output/exp1/
+  save_every: 10
+  visualize: true
