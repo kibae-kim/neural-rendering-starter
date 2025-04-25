@@ -1,0 +1,1 @@
+data/nerf_synthetic/lego/colmap_output/database.db filter=lfs diff=lfs merge=lfs -text
