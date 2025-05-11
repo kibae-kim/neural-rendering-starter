@@ -94,8 +94,7 @@ def main():
     dataset = NeRFDataset(str(images_dir), str(images_txt), str(cameras_txt),
                           render_cfg['image_size'])
     dl = DataLoader(dataset,
-                    batch_size=train_cfg['batch_size'],
-                    shuffle=True, num_workers=4,
+                    batch_size=train_cfg['batch_size'], 
                     shuffle=True, num_workers=0, # Changed
                     pin_memory=(device.type == "cuda"))
 
