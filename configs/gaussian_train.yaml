@@ -23,7 +23,7 @@ gaussian:
 render:
   background: 'black'
   camera_path: './data/camera_path.json'
-  image_size: [800, 800]
+  image_size: [400, 400] # Resolution Changed
 
 # 체크포인트 및 로그 설정
 logging:
