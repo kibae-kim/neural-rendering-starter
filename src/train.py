@@ -110,7 +110,7 @@ def main():
     # ════════════════ Optimizer & AMP ════════════════
     optimizer = torch.optim.Adam(gaussians.parameters(),
                                  lr=train_cfg['learning_rate'])
-    scaler = amp.GradScaler(device_type="cuda") if device.type == "cuda" else None
+    scaler = amp.GradScaler() if device.type == "cuda" else None
 
     # ════════════════ Resume ════════════════
     start_epoch = 1
