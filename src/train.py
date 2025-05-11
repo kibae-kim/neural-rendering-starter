@@ -135,15 +135,15 @@ def main():
             pose = {k: v.to(device, non_blocking=True) for k, v in pose.items()}
 
             if scaler:
-                with amp.autocast(device_type="cuda"):
-                    rendered = renderer(gaussians, pose, tile_hw=32)     # CHANGED
+                with amp.autocast(device_type="cuda",dtype=torch.float16): #float64->16
+                    rendered = renderer(gaussians, pose, tile_hw=16)     # CHANGED
                     loss = F.mse_loss(rendered, target)
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                rendered = renderer(gaussians, pose, tile_hw=32)         # CHANGED
+                rendered = renderer(gaussians, pose, tile_hw=16)         # CHANGED
                 loss = F.mse_loss(rendered, target)
                 optimizer.zero_grad()
                 loss.backward()
@@ -161,7 +161,7 @@ def main():
                        output_dir / f"epoch{epoch:03d}.pt")
 
             with torch.no_grad():
-                preview = renderer(gaussians, preview_pose, tile_hw=32)[0]  # CHANGED
+                preview = renderer(gaussians, preview_pose, tile_hw=16)[0]  # CHANGED
             from imageio import imwrite
             imwrite(output_dir / f"render{epoch:03d}.png",
                     (preview.cpu().permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype('uint8'))
