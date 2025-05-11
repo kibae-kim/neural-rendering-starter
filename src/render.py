@@ -63,7 +63,7 @@ class DifferentiableRenderer(nn.Module):
 
     # --------------------------------------------------------------
      # --------------------------------------------------------------
-    def forward(self, gaussian_cloud, pose, tile_hw: int = 256):
+    def forward(self, gaussian_cloud, pose, tile_hw: int = 64): # 256->64
         """
         tile_hw : 정방 타일 한 변 픽셀 수 (기본 256).
                   줄이면 메모리↓ 속도↑, 늘리면 그 반대.
@@ -78,7 +78,8 @@ class DifferentiableRenderer(nn.Module):
 
         B, N = qvecs.shape[0], positions.shape[0]
         HW   = self.H * self.W
-        tiles = torch.arange(0, HW, tile_hw * tile_hw, device=self.device)
+        tiles = torch.arange(0, self.H*self.W, tile_hw * tile_hw, device=self.device)
+        # H*W -> self.H*self.W
 
         rendered = []
         for b in range(B):
