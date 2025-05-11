@@ -1,4 +1,13 @@
-torch
-matplotlib
-imageio
-opencv-python
+# ───────── Core Deep‑Learning stack ─────────
+torch>=2.1          # torch, torch.cuda.amp, torch.nn.*  (gaussian_point, render, train)
+torchvision>=0.16   # transforms.Resize, ToTensor        (train)
+
+# ───────── Scientific / utility ─────────────
+numpy               # ndarray, dtype                      (init_from_sfm)
+Pillow              # PIL.Image                           (train)
+PyYAML              # yaml.safe_load                     (render, train)
+imageio             # imwrite for preview PNG             (train)
+tqdm                # Optional progress bars (not imported yet, but handy)
+
+# ───────── (Optional) COLMAP bindings ───────
+# pycolmap         
