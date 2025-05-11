@@ -95,8 +95,8 @@ def main():
                           render_cfg['image_size'])
     dl = DataLoader(dataset,
                     batch_size=train_cfg['batch_size'],
-                    shuffle=True,
-                    num_workers=4,
+                    shuffle=True, num_workers=4,
+                    shuffle=True, num_workers=0, # Changed
                     pin_memory=(device.type == "cuda"))
 
     # preview sample (첫 프레임 고정)
