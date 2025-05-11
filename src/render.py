@@ -1,14 +1,7 @@
-# src/render.py  ── Differentiable 2‑D splat renderer
-# 메모리 폭주(OOM) 해결용 패치
-#   • chunk_gauss 16 k → **4 k** (# CHANGED)
-#   • 타일 루프마다 torch.cuda.empty_cache() 호출 (# NEW)
-#   • 나머지 구조/주석은 유지
-# ------------------------------------------------------------------------------
-
-import torch
-import torch.nn as nn
-import yaml
+# Differentiable 2‑D splat renderer (ultra‑low‑mem)
+import torch, yaml
 from pathlib import Path
+from torch import nn
 from gaussian.init_from_sfm import read_cameras
 
 
@@ -18,93 +11,81 @@ class DifferentiableRenderer(nn.Module):
         self.H, self.W = image_size
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # ── load camera intrinsics ────────────────────────────────────────────
+        # ── intrinsics ──────────────────────────────────────────
         root = Path(__file__).resolve().parents[1]
         cfg  = yaml.safe_load(open(root / "configs" / "gaussian_train.yaml"))
         cam0 = next(iter(read_cameras(str(
             root / cfg["data"]["root"] /
             cfg["data"]["colmap_output_dir"] / "sparse/0/cameras.txt"
         )).values()))
-
         if cam0["model"].startswith("SIMPLE_RADIAL"):
             f, cx, cy = cam0["params"][:3]; fx = fy = f
-        elif cam0["model"] == "PINHOLE":
+        else:                                  # PINHOLE 외 형식 생략
             fx, fy, cx, cy = cam0["params"][:4]
-        else:
-            raise NotImplementedError(cam0["model"])
+        self.fx, self.fy = map(lambda v: torch.tensor(v, device=self.device), (fx, fy))
+        self.cx, self.cy = map(lambda v: torch.tensor(v, device=self.device), (cx, cy))
 
-        self.fx = torch.tensor(fx, device=self.device)
-        self.fy = torch.tensor(fy, device=self.device)
-        self.cx = torch.tensor(cx, device=self.device)
-        self.cy = torch.tensor(cy, device=self.device)
-
-        xs = torch.arange(self.W, device=self.device)
-        ys = torch.arange(self.H, device=self.device)
+        xs = torch.arange(self.W, device=self.device); ys = torch.arange(self.H, device=self.device)
         yy, xx = torch.meshgrid(ys, xs, indexing="ij")
         self.pixel_coords = torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)  # (HW,2)
 
-    # ------------------------------------------------------------------
+    # ----------------------------------------------------------
     @staticmethod
-    def quaternion_to_rotation_matrix(q: torch.Tensor) -> torch.Tensor:
+    def quat2mat(q):
         q = q / q.norm(); w, x, y, z = q
         return torch.stack([
-            torch.tensor([1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)]),
-            torch.tensor([2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)]),
-            torch.tensor([2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)])
+            torch.tensor([1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)]),
+            torch.tensor([2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)]),
+            torch.tensor([2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)])
         ], 0).to(q)
 
-    # ------------------------------------------------------------------
-    def forward(self, gaussian_cloud, pose,
-                tile_hw: int = 8,
-                chunk_gauss: int = 4096   # CHANGED  4 k 씩 처리
-                ):
+    # ----------------------------------------------------------
+    def forward(self, cloud, pose,
+                tile_hw=8,
+                chunk_gauss=256,            # CHANGED  더 작은 청크
+                tile_range=None):           # NEW  (start,end) 만 렌더
+        pos = cloud.positions.to(self.device, torch.float16)
+        col = cloud.colors.to(self.device,   torch.float16)
+        opa = cloud.opacities.to(self.device,torch.float16)
+        sc  = cloud.scales.to(self.device,   torch.float16)
+        qv  = pose["qvec"].to(self.device); tv = pose["tvec"].to(self.device)
 
-        pos = gaussian_cloud.positions.to(self.device, torch.float16)
-        col = gaussian_cloud.colors.to(self.device,   torch.float16)
-        opa = gaussian_cloud.opacities.to(self.device, torch.float16)
-        sc  = gaussian_cloud.scales.to(self.device,    torch.float16)
-        qv  = pose["qvec"].to(self.device, torch.float32)
-        tv  = pose["tvec"].to(self.device, torch.float32)
-
-        B, N, HW = qv.shape[0], pos.shape[0], self.H * self.W
-        tiles = torch.arange(0, HW, tile_hw*tile_hw, device=self.device)
+        B, N, HW = qv.shape[0], pos.shape[0], self.H*self.W
+        if tile_range is None:
+            tiles = torch.arange(0, HW, tile_hw*tile_hw, device=self.device)
+        else:  # 단일 타일 전용
+            tiles = torch.tensor(tile_range, device=self.device)
 
         rendered = []
         for b in range(B):
-            R = self.quaternion_to_rotation_matrix(qv[b])
-            t = tv[b].unsqueeze(0)
+            R = self.quat2mat(qv[b]); t = tv[b].unsqueeze(0)
+            proj = (R @ pos.t()).t().float() + t
+            proj = torch.stack([(proj[:,0]/proj[:,2])*self.fx + self.cx,
+                                (proj[:,1]/proj[:,2])*self.fy + self.cy], 1)
 
-            p_cam = (R @ pos.t()).t().float() + t
-            proj = torch.stack([(p_cam[:, 0] / p_cam[:, 2]) * self.fx + self.cx,
-                                (p_cam[:, 1] / p_cam[:, 2]) * self.fy + self.cy], 1)
+            img_acc = torch.zeros(len(tiles)*tile_hw*tile_hw, 3,
+                                  device=self.device, dtype=torch.float16)
+            w_acc   = torch.zeros_like(img_acc[..., :1])
 
-            img_acc = torch.zeros(HW, 3, device=self.device, dtype=torch.float32)
-            w_acc   = torch.zeros(HW, 1, device=self.device, dtype=torch.float32)
+            for g0 in range(0, N, chunk_gauss):
+                g1 = min(g0+chunk_gauss, N)
+                proj_g, col_g, opa_g = proj[g0:g1], col[g0:g1], opa[g0:g1]
+                var_g = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)
 
-            # ── gauss‑chunk & tile loops ───────────────────────────────────
-            for g0 in range(0, N, chunk_gauss):                          # CHANGED
-                g1 = min(g0 + chunk_gauss, N)
-                proj_g  = proj[g0:g1]
-                col_g   = col[g0:g1]
-                opa_g   = opa[g0:g1]
-                var_g   = (sc[g0:g1].squeeze(-1) ** 2).unsqueeze(1)
-
-                for start in tiles:
+                for i, start in enumerate(tiles):
                     end = min(start + tile_hw*tile_hw, HW)
                     coords = self.pixel_coords[start:end]
 
                     diff  = (coords.unsqueeze(0) - proj_g.unsqueeze(1)).half()
                     dist2 = (diff**2).sum(-1).float()
-                    w     = opa_g * torch.exp(-0.5 * dist2 / var_g)
+                    w     = opa_g * torch.exp(-0.5*dist2 / var_g)
 
                     num = (w.unsqueeze(-1) * col_g.unsqueeze(1)).sum(0)
                     den = w.sum(0).unsqueeze(-1) + 1e-8
-                    img_acc[start:end] += num
-                    w_acc[start:end]   += den
+                    img_acc[i*tile_hw*tile_hw:(i+1)*tile_hw*tile_hw] += num
+                    w_acc[i*tile_hw*tile_hw:(i+1)*tile_hw*tile_hw]  += den
 
-                    torch.cuda.empty_cache()            # NEW  중간 캐시 즉시 해제
-
-            img = (img_acc / w_acc.clamp(min=1e-8)).t().reshape(3, self.H, self.W)
-            rendered.append(img)
+            img = (img_acc / w_acc.clamp(min=1e-8)).t().reshape(3, len(tiles)*tile_hw, tile_hw)
+            rendered.append(img[:, :self.H, :self.W])     # 안전 절삭
 
         return torch.stack(rendered, 0)  # (B,3,H,W)
