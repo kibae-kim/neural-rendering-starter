@@ -1,7 +1,7 @@
 # 학습 관련 설정
 train:
   learning_rate: 0.01
-  batch_size: 32 # batch_size is changed 128->32
+  batch_size: 4 # batch_size is changed 128->32->4
   epochs: 100
   loss: 'l2'
   optimizer: 'adam'

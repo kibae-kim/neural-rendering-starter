@@ -92,9 +92,13 @@ class DifferentiableRenderer(nn.Module):
             proj = torch.stack([x * self.fx + self.cx,
                                 y * self.fy + self.cy], dim=1)  # (N,2)
 
-            tile_imgs = []
+            #tile_imgs = [] is canceled
+            tile_imgs = torch.empty(HW, 3, device=self.device)
+            offset = 0
+            
             for start in tiles:
                 end = min(start + tile_hw * tile_hw, HW)
+                T = end - start
                 coords = self.pixel_coords[start:end]           # (T,2)
 
                 diff  = coords.unsqueeze(0) - proj.unsqueeze(1)  # (N,T,2)
@@ -105,10 +109,13 @@ class DifferentiableRenderer(nn.Module):
                 num = (w.unsqueeze(-1) * colors.unsqueeze(1)).sum(0)  # (T,3)
                 den = w.sum(0).unsqueeze(-1) + 1e-8
                 tile = num / den                                     # (T,3)
-                tile_imgs.append(tile)
+                # tile_imgs.append(tile) is canceled
+                tile_imgs[offset:offset+T] = tile
+                offset += T
 
-            img_flat = torch.cat(tile_imgs, 0)             # (HW,3)
-            img = img_flat.t().reshape(3, self.H, self.W)  # (3,H,W)
+            # img_flat = torch.cat(tile_imgs, 0) # (HW,3) is canceled
+            # img = img_flat.t().reshape(3, self.H, self.W) # (3,H,W) is cancel
+            img = tile_imgs.t().reshape(3, self.H, self.W)
             rendered.append(img)
 
         return torch.stack(rendered, 0)  # (B,3,H,W)
