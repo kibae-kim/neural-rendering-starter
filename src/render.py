@@ -62,39 +62,52 @@ class DifferentiableRenderer(nn.Module):
         return R
 
     # --------------------------------------------------------------
-    def forward(self, gaussian_cloud, pose):
+     # --------------------------------------------------------------
+    def forward(self, gaussian_cloud, pose, tile_hw: int = 256):
+        """
+        tile_hw : 정방 타일 한 변 픽셀 수 (기본 256).
+                  줄이면 메모리↓ 속도↑, 늘리면 그 반대.
+        """
         # 모든 텐서를 동일 디바이스로
-        positions = gaussian_cloud.positions.to(self.device)   # (N,3)               # CHANGED
-        colors    = gaussian_cloud.colors.to(self.device)      # (N,3)               # CHANGED
-        opacities = gaussian_cloud.opacities.to(self.device)   # (N,1)               # CHANGED
-        scales    = gaussian_cloud.scales.to(self.device)      # (N,1)               # CHANGED
-        qvecs     = pose['qvec'].to(self.device)               # (B,4)               # CHANGED
-        tvecs     = pose['tvec'].to(self.device)               # (B,3)               # CHANGED
+        positions = gaussian_cloud.positions.to(self.device)
+        colors    = gaussian_cloud.colors.to(self.device)
+        opacities = gaussian_cloud.opacities.to(self.device)
+        scales    = gaussian_cloud.scales.to(self.device)
+        qvecs     = pose['qvec'].to(self.device)
+        tvecs     = pose['tvec'].to(self.device)
 
-        B, N, HW = qvecs.shape[0], positions.shape[0], self.H * self.W
+        B, N = qvecs.shape[0], positions.shape[0]
+        HW   = self.H * self.W
+        tiles = torch.arange(0, HW, tile_hw * tile_hw, device=self.device)
+
         rendered = []
-
         for b in range(B):
             R = self.quaternion_to_rotation_matrix(qvecs[b])
             t = tvecs[b].unsqueeze(0)
-            # world → camera
             p_cam = (R @ positions.t()).t() + t  # (N,3)
 
             x = p_cam[:, 0] / p_cam[:, 2]
             y = p_cam[:, 1] / p_cam[:, 2]
-            u = x * self.fx + self.cx
-            v = y * self.fy + self.cy
-            proj = torch.stack([u, v], dim=1)    # (N,2)
+            proj = torch.stack([x * self.fx + self.cx,
+                                y * self.fy + self.cy], dim=1)  # (N,2)
 
-            diff  = self.pixel_coords.unsqueeze(0) - proj.unsqueeze(1)  # (N,HW,2)
-            dist2 = (diff ** 2).sum(-1)                                 # (N,HW)
-            var   = (scales.squeeze(-1) ** 2).unsqueeze(1)
-            w     = opacities * torch.exp(-0.5 * dist2 / var)           # (N,HW)
+            tile_imgs = []
+            for start in tiles:
+                end = min(start + tile_hw * tile_hw, HW)
+                coords = self.pixel_coords[start:end]           # (T,2)
 
-            num = (w.unsqueeze(-1) * colors.unsqueeze(1)).sum(0)        # (HW,3)
-            den = w.sum(0).unsqueeze(-1) + 1e-8
-            img = (num / den).t().reshape(3, self.H, self.W)            # (3,H,W)
+                diff  = coords.unsqueeze(0) - proj.unsqueeze(1)  # (N,T,2)
+                dist2 = (diff ** 2).sum(-1)                     # (N,T)
+                var   = (scales.squeeze(-1) ** 2).unsqueeze(1)
+                w     = opacities * torch.exp(-0.5 * dist2 / var)
 
+                num = (w.unsqueeze(-1) * colors.unsqueeze(1)).sum(0)  # (T,3)
+                den = w.sum(0).unsqueeze(-1) + 1e-8
+                tile = num / den                                     # (T,3)
+                tile_imgs.append(tile)
+
+            img_flat = torch.cat(tile_imgs, 0)             # (HW,3)
+            img = img_flat.t().reshape(3, self.H, self.W)  # (3,H,W)
             rendered.append(img)
 
-        return torch.stack(rendered, dim=0)  # (B,3,H,W)
+        return torch.stack(rendered, 0)  # (B,3,H,W)
