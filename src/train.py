@@ -72,7 +72,7 @@ def main():
                     pred_tile = renderer(cloud, pose, tile_hw=8, chunk_gauss=256,
                                         tile_range=(t, end))[0] #(3,16,8)
                     pred_flat = pred_tile.view(3, -1) #(3,128)->(3,64)
-                    loss_t = F.mse_loss(pred_flat, img.view(3,-1)[:, t.end])
+                    loss_t = F.mse_loss(pred_flat, img.view(3,-1)[:, t:end])
 
                 scaler.scale(loss_t).backward()
                 scaler.step(opt); scaler.update()
