@@ -18,6 +18,7 @@ gaussian:
   init_method: 'sfm'   # SfM 포인트로 초기화
   scale_variance: true
   num_gaussians: 100000
+  init_scale: 0.3 # Changed, Gaussian scale up
 
 # 렌더링 관련
 render:

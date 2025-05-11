@@ -18,7 +18,7 @@ class GaussianPointCloud(nn.Module):
         N = positions.shape[0]
 
         self.positions = nn.Parameter(positions)  # (N, 3)
-        self.opacities = nn.Parameter(torch.ones(N, 1) * 0.1)  # 초기 opacity
+        self.opacities = nn.Parameter(torch.ones(N, 1) * 0.5)  #Changed0.5, initial Opacity
 
         if colors is not None:
             assert colors.shape == (N, 3), "Colors must be (N, 3)"

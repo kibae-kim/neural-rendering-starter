@@ -131,6 +131,16 @@ def main():
 
     # ════════════════ Training loop ════════════════
     for epoch in range(start_epoch, train_cfg['epochs'] + 1):
+        
+        # Debugging
+        # ----------------------------------------------------------------------
+        if epoch == start_epoch:                                # for firsh epoch
+            print(f"[DEBUG] dataset={len(dataset)} imgs | "
+                  f"batches per epoch={len(dl)}")
+            first_batch = next(iter(dl))
+            print(f"[DEBUG] first batch tensor shape = {first_batch[0].shape}")
+        # -----------------------------------------------------------------------
+
         epoch_loss = 0.0
         for target, pose in dl:
             target = target.to(device, non_blocking=True)
@@ -169,7 +179,8 @@ def main():
 
             with torch.no_grad():
                 #preview = renderer(gaussians, preview_pose)[0] is deleted
-                preview = rendered(gaussians, preview_pose, tile_hw=64)[0] #Changed
+                #rendred->renderer
+                preview = renderer(gaussians, preview_pose, tile_hw=64)[0] #Changed
             img = preview.cpu().permute(1, 2, 0).clamp(0, 1).numpy()
             from imageio import imwrite
             imwrite(output_dir / f"render{epoch:03d}.png",
