@@ -1,14 +1,13 @@
 # src/train.py  ── 3‑D Gaussian Splatting training script
-# (handles resume=None gracefully, uses new torch.amp API)
+# (handles resume=None gracefully, tile‑wise rendering, robust file→meta match)
 
 import argparse
 from pathlib import Path
-
 import yaml
 from PIL import Image
 import torch
 import torch.nn.functional as F
-from torch import amp                       # ⬅️  GradScaler / autocast (PyTorch ≥2.1)
+from torch import amp                      # GradScaler / autocast (PyTorch ≥2.1)
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -21,13 +20,19 @@ from render import DifferentiableRenderer
 # --------------------------- Dataset ---------------------------
 class NeRFDataset(Dataset):
     def __init__(self, images_dir, images_txt, cameras_txt, image_size):
-        #self.image_paths = sorted(Path(images_dir).glob("r_*.png")) is canceled
+        # RGB만 로드(_depth 제외)                                 # CHANGED
         self.image_paths = sorted(
             p for p in Path(images_dir).glob("r_*.png") if "_depth" not in p.name
         )
-        self.images_meta = read_images(images_txt)
-        self.cameras     = read_cameras(cameras_txt)
-        self.transform   = transforms.Compose([
+
+        # meta를 번호(index)→meta로 매핑해 견고하게 검색        # NEW
+        images_meta_raw = read_images(images_txt)
+        self.id2meta = {}
+        for m in images_meta_raw.values():
+            num = int(''.join(filter(str.isdigit, Path(m['file']).stem)))
+            self.id2meta[num] = m
+
+        self.transform = transforms.Compose([
             transforms.Resize(tuple(image_size)),
             transforms.ToTensor()
         ])
@@ -37,11 +42,11 @@ class NeRFDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        img      = Image.open(img_path).convert("RGB")
-        target   = self.transform(img)
+        img = Image.open(img_path).convert("RGB")
+        target = self.transform(img)
 
-        meta = next(v for v in self.images_meta.values()
-                    if v['file'] == img_path.name)
+        num = int(''.join(filter(str.isdigit, img_path.stem)))
+        meta = self.id2meta[num]                                 # robust lookup
         pose = {
             'qvec': torch.from_numpy(meta['qvec']),
             'tvec': torch.from_numpy(meta['tvec'])
@@ -64,21 +69,15 @@ def main():
     REPO_ROOT = Path(__file__).resolve().parents[1]
 
     # ════════════════ Load config ════════════════
-    cfg_path = (REPO_ROOT / args.cfg).resolve()
-    cfg      = yaml.safe_load(open(cfg_path, 'r'))
-
-    train_cfg    = cfg['train']
-    data_cfg     = cfg['data']
-    render_cfg   = cfg['render']
-    logging_cfg  = cfg['logging']
-    gaussian_cfg = cfg['gaussian']
+    cfg = yaml.safe_load(open(REPO_ROOT / args.cfg, 'r'))
+    train_cfg, data_cfg = cfg['train'], cfg['data']
+    render_cfg, logging_cfg, gaussian_cfg = cfg['render'], cfg['logging'], cfg['gaussian']
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ════════════════ Gaussian cloud init ════════════════
-    points3d_file = (REPO_ROOT / data_cfg['root'] /
-                     data_cfg['colmap_output_dir'] / "sparse/0/points3D.txt")
-    xyz, rgb = read_points3D(points3d_file)
+    xyz, rgb = read_points3D(REPO_ROOT / data_cfg['root'] /
+                             data_cfg['colmap_output_dir'] / "sparse/0/points3D.txt")
     gaussians = create_gaussian_cloud_from_points(
         (xyz, rgb),
         scale=train_cfg.get("gaussian_scale", 1.0),
@@ -86,44 +85,37 @@ def main():
     ).to(device)
 
     # ════════════════ Renderer ════════════════
-    cameras_txt = (REPO_ROOT / data_cfg['root'] /
-                   data_cfg['colmap_output_dir'] / "sparse/0/cameras.txt")
-    images_txt  = (REPO_ROOT / data_cfg['root'] /
-                   data_cfg['colmap_output_dir'] / "sparse/0/images.txt")
     renderer = DifferentiableRenderer(render_cfg['image_size']).to(device)
 
     # ════════════════ Dataset / DataLoader ════════════════
     images_dir = REPO_ROOT / data_cfg['root'] / data_cfg['images_dir']
-    dataset = NeRFDataset(str(images_dir), str(images_txt), str(cameras_txt),
-                          render_cfg['image_size'])
+    images_txt = REPO_ROOT / data_cfg['root'] / data_cfg['colmap_output_dir'] / "sparse/0/images.txt"
+    cameras_txt = REPO_ROOT / data_cfg['root'] / data_cfg['colmap_output_dir'] / "sparse/0/cameras.txt"
+
+    dataset = NeRFDataset(images_dir, images_txt, cameras_txt, render_cfg['image_size'])
     dl = DataLoader(dataset,
-                    batch_size=train_cfg['batch_size'], 
-                    shuffle=True, num_workers=0, # Changed
+                    batch_size=train_cfg.get('batch_size', 4),        # CHANGED (작게)
+                    shuffle=True,
+                    num_workers=0,                                    # CHANGED
                     pin_memory=(device.type == "cuda"))
 
     # preview sample (첫 프레임 고정)
     preview_target, preview_pose = dataset[0]
-    preview_target = preview_target.unsqueeze(0).to(device)
-    preview_pose = {
-        'qvec': preview_pose['qvec'].unsqueeze(0).to(device),
-        'tvec': preview_pose['tvec'].unsqueeze(0).to(device)
-    }
+    preview_pose = {k: v.unsqueeze(0).to(device) for k, v in preview_pose.items()}
 
     # ════════════════ Optimizer & AMP ════════════════
-    optimizer = torch.optim.Adam(gaussians.parameters(),
-                                 lr=train_cfg['learning_rate'])
+    optimizer = torch.optim.Adam(gaussians.parameters(), lr=train_cfg['learning_rate'])
     scaler = amp.GradScaler() if device.type == "cuda" else None
 
     # ════════════════ Resume ════════════════
-    start_epoch = 1
-    output_dir  = (REPO_ROOT / logging_cfg['output_dir']).resolve()
+    start_epoch, output_dir = 1, (REPO_ROOT / logging_cfg['output_dir']).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     resume_path = args.resume
     if isinstance(resume_path, str) and resume_path.lower() in ("none", ""):
         resume_path = None
 
-    if resume_path is not None:
+    if resume_path:
         ckpt = torch.load(resume_path, map_location=device)
         gaussians.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["opt"])
@@ -132,35 +124,26 @@ def main():
     else:
         print("[Resume] None → starting fresh training")
 
+    # ════════════════ Debug info ════════════════
+    print(f"[DEBUG] dataset={len(dataset)} imgs | batches per epoch={len(dl)}")
+
     # ════════════════ Training loop ════════════════
     for epoch in range(start_epoch, train_cfg['epochs'] + 1):
-        
-        # Debugging
-        # ----------------------------------------------------------------------
-        if epoch == start_epoch:                                # for firsh epoch
-            print(f"[DEBUG] dataset={len(dataset)} imgs | "
-                  f"batches per epoch={len(dl)}")
-            first_batch = next(iter(dl))
-            print(f"[DEBUG] first batch tensor shape = {first_batch[0].shape}")
-        # -----------------------------------------------------------------------
-
         epoch_loss = 0.0
         for target, pose in dl:
             target = target.to(device, non_blocking=True)
-            pose['qvec'] = pose['qvec'].to(device, non_blocking=True)
-            pose['tvec'] = pose['tvec'].to(device, non_blocking=True)
+            pose = {k: v.to(device, non_blocking=True) for k, v in pose.items()}
 
-            if scaler:   # CUDA + mixed precision
-                with amp.autocast(device_type="cuda", enabled=True):
-                    #rendered = renderer(gaussians, pose) is deleted
-                    rendered = renderer(gaussians, pose, tile_hw=32) #Changed 64->32
+            if scaler:
+                with amp.autocast(device_type="cuda"):
+                    rendered = renderer(gaussians, pose, tile_hw=32)     # CHANGED
                     loss = F.mse_loss(rendered, target)
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
-            else:        # CPU or no‑AMP
-                rendered = renderer(gaussians, pose)
+            else:
+                rendered = renderer(gaussians, pose, tile_hw=32)         # CHANGED
                 loss = F.mse_loss(rendered, target)
                 optimizer.zero_grad()
                 loss.backward()
@@ -168,26 +151,20 @@ def main():
 
             epoch_loss += loss.item()
 
-        avg_loss = epoch_loss / len(dl)
-        print(f"E{epoch:03d}/{train_cfg['epochs']} | Loss {avg_loss:.6f}")
+        print(f"E{epoch:03d}/{train_cfg['epochs']} | Loss {epoch_loss / len(dl):.6f}")
 
         # ════════════════ Checkpoint & preview ════════════════
         if epoch % logging_cfg['save_every'] == 0:
-            ckpt_path = output_dir / f"epoch{epoch:03d}.pt"
-            torch.save(
-                {"model": gaussians.state_dict(),
-                 "opt":   optimizer.state_dict(),
-                 "epoch": epoch},
-                ckpt_path)
+            torch.save({"model": gaussians.state_dict(),
+                        "opt":   optimizer.state_dict(),
+                        "epoch": epoch},
+                       output_dir / f"epoch{epoch:03d}.pt")
 
             with torch.no_grad():
-                #preview = renderer(gaussians, preview_pose)[0] is deleted
-                #rendred->renderer, tile_hw=64->32
-                preview = renderer(gaussians, preview_pose, tile_hw=32)[0] 
-            img = preview.cpu().permute(1, 2, 0).clamp(0, 1).numpy()
+                preview = renderer(gaussians, preview_pose, tile_hw=32)[0]  # CHANGED
             from imageio import imwrite
             imwrite(output_dir / f"render{epoch:03d}.png",
-                    (img * 255).astype('uint8'))
+                    (preview.cpu().permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype('uint8'))
 
 
 if __name__ == "__main__":
