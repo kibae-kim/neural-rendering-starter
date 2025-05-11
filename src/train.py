@@ -21,7 +21,10 @@ from render import DifferentiableRenderer
 # --------------------------- Dataset ---------------------------
 class NeRFDataset(Dataset):
     def __init__(self, images_dir, images_txt, cameras_txt, image_size):
-        self.image_paths = sorted(Path(images_dir).glob("r_*.png"))
+        #self.image_paths = sorted(Path(images_dir).glob("r_*.png")) is canceled
+        self.image_paths = sorted(
+            p for p in Path(images_dir).glob("r_*.png") if "_depth" not in p.name
+        )
         self.images_meta = read_images(images_txt)
         self.cameras     = read_cameras(cameras_txt)
         self.transform   = transforms.Compose([
