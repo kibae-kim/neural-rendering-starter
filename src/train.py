@@ -153,7 +153,7 @@ def main():
             if scaler:   # CUDA + mixed precision
                 with amp.autocast(device_type="cuda", enabled=True):
                     #rendered = renderer(gaussians, pose) is deleted
-                    rendered = renderer(gaussians, pose, tile_hw=64) #Changed
+                    rendered = renderer(gaussians, pose, tile_hw=32) #Changed 64->32
                     loss = F.mse_loss(rendered, target)
                 optimizer.zero_grad(set_to_none=True)
                 scaler.scale(loss).backward()
@@ -182,8 +182,8 @@ def main():
 
             with torch.no_grad():
                 #preview = renderer(gaussians, preview_pose)[0] is deleted
-                #rendred->renderer
-                preview = renderer(gaussians, preview_pose, tile_hw=64)[0] #Changed
+                #rendred->renderer, tile_hw=64->32
+                preview = renderer(gaussians, preview_pose, tile_hw=32)[0] 
             img = preview.cpu().permute(1, 2, 0).clamp(0, 1).numpy()
             from imageio import imwrite
             imwrite(output_dir / f"render{epoch:03d}.png",
