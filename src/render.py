@@ -54,7 +54,10 @@ class DifferentiableRenderer(nn.Module):
         if tile_range is None:
             tiles = torch.arange(0, HW, tile_hw*tile_hw, device=self.device)
         else:  # 단일 타일 전용
-            tiles = torch.tensor(tile_range, device=self.device)
+            #tiles = torch.tensor(tile_range, device=self.device)
+            tiles = torch.arange(tile_range[0], tile_range[1],
+                                tile_hw*tile_hw, device=self.device)
+            
 
         rendered = []
         for b in range(B):
