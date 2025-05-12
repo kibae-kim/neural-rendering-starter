@@ -9,17 +9,17 @@ class DifferentiableRenderer(nn.Module):
         self.H, self.W = image_size
         self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # ── Load intrinsics from configs/gaussian_train.yaml ───────────────
+        # Load intrinsics from your existing config
         repo = Path(__file__).resolve().parents[1]
         cfg  = yaml.safe_load(open(repo / "configs" / "gaussian_train.yaml"))
 
-        camfile = (
+        cam_txt = (
             repo
             / cfg["data"]["root"]
             / cfg["data"]["colmap_output_dir"]
             / "sparse/0/cameras.txt"
         )
-        cam0 = next(iter(read_cameras(str(camfile)).values()))
+        cam0 = next(iter(read_cameras(str(cam_txt)).values()))
 
         if cam0["model"].startswith("SIMPLE_RADIAL"):
             f, cx, cy = cam0["params"][:3]
@@ -27,13 +27,11 @@ class DifferentiableRenderer(nn.Module):
         else:  # PINHOLE
             fx, fy, cx, cy = cam0["params"][:4]
 
-        # store as tensors
         self.fx = torch.tensor(fx, device=self.dev, dtype=torch.float32)
         self.fy = torch.tensor(fy, device=self.dev, dtype=torch.float32)
         self.cx = torch.tensor(cx, device=self.dev, dtype=torch.float32)
         self.cy = torch.tensor(cy, device=self.dev, dtype=torch.float32)
 
-        # precompute pixel grid
         xs = torch.arange(self.W, device=self.dev, dtype=torch.float32)
         ys = torch.arange(self.H, device=self.dev, dtype=torch.float32)
         yy, xx = torch.meshgrid(ys, xs, indexing="ij")
@@ -53,31 +51,20 @@ class DifferentiableRenderer(nn.Module):
                 tile_hw: int = 64,
                 chunk_gauss: int = 8192,
                 tile_range: tuple | None = None):
-        """
-        Render one batch (assumed batch_size=1) in tiles:
-        - tile_hw: size of each square tile (px)
-        - chunk_gauss: how many gaussians to process at once
-        - tile_range: (start, end) linear pixel indices to render one tile;
-                      if None, renders all non-overlapping tiles in row-major order.
-        Returns a tensor of shape (#tiles, 3, tile_hw, tile_hw)
-        """
-        # move cloud to FP16 for positions/colors/opacities/scales
-        pos = cloud.positions.to(self.dev, torch.float16)   # (N,3)
-        col = cloud.colors   .to(self.dev, torch.float16)   # (N,3)
-        opa = cloud.opacities.to(self.dev, torch.float16)   # (N,1)
-        sc  = cloud.scales   .to(self.dev, torch.float16)   # (N,1)
+        pos = cloud.positions.to(self.dev, torch.float16)
+        col = cloud.colors.to(self.dev,   torch.float16)
+        opa = cloud.opacities.to(self.dev, torch.float16)
+        sc  = cloud.scales.to(self.dev,   torch.float16)
 
-        # single-image batch assumed
-        q = pose["qvec"][0].to(self.dev)   # (4,)
-        t = pose["tvec"][0].to(self.dev)   # (3,)
-        R = self.quat2mat(q)               # (3,3)
+        q = pose["qvec"][0].to(self.dev)
+        t = pose["tvec"][0].to(self.dev)
+        R = self.quat2mat(q)
 
-        # project once
-        p_cam = (R @ pos.t()).t().float() + t.unsqueeze(0)  # (N,3) in FP32
+        p_cam = (R @ pos.t()).t().float() + t.unsqueeze(0)
         proj = torch.stack([
             (p_cam[:,0]/p_cam[:,2]) * self.fx + self.cx,
-            (p_cam[:,1]/p_cam[:,2]) * self.fy + self.cy
-        ], dim=1)  # (N,2)
+            (p_cam[:,1]/p_cam[:,2]) * self.fy + self.cy,
+        ], dim=1)
 
         HW   = self.H * self.W
         step = tile_hw * tile_hw
@@ -88,36 +75,29 @@ class DifferentiableRenderer(nn.Module):
 
         out = []
         for s in starts:
-            coords = self.pix[s : s + step]                     # (step,2)
+            coords = self.pix[s : s + step]  # (step,2)
 
-            # **ACCUMULATE IN FP32** to avoid nan
             acc_num = torch.zeros(step, 3, dtype=torch.float32, device=self.dev)
             acc_den = torch.zeros(step, 1, dtype=torch.float32, device=self.dev)
 
-            # gaussian chunks
             N = pos.shape[0]
             for g0 in range(0, N, chunk_gauss):
                 g1 = min(g0 + chunk_gauss, N)
-                pj = proj[g0:g1]       # (g,2)
-                cl = col[g0:g1]        # (g,3)
-                op = opa[g0:g1]        # (g,1)
-                var = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)  # (g,1)
+                pj = proj[g0:g1]
+                cl = col [g0:g1]
+                op = opa [g0:g1]
+                var = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)
 
-                # compute weights
-                diff  = (coords.unsqueeze(0) - pj.unsqueeze(1)).half()  # (g,step,2)
-                dist2 = (diff**2).sum(-1).float()                       # (g,step)
-                w     = op * torch.exp(-0.5 * dist2 / var)             # (g,step)
+                diff  = (coords.unsqueeze(0) - pj.unsqueeze(1)).half()
+                dist2 = (diff**2).sum(-1).float()
+                w     = op * torch.exp(-0.5 * dist2 / var)
 
-                num = (w.unsqueeze(-1) * cl.unsqueeze(1)).sum(0).float()  # (step,3)
-                den = (w.sum(0).unsqueeze(-1)).float() + 1e-8            # (step,1)
-
+                num = (w.unsqueeze(-1) * cl.unsqueeze(1)).sum(0).float()
+                den = w.sum(0).unsqueeze(-1).float() + 1e-8
                 acc_num += num
                 acc_den += den
 
-            # tile in FP32, then reshape
-            tile = (acc_num / acc_den.clamp(min=1e-8)) \
-                        .t() \
-                        .reshape(3, tile_hw, tile_hw)
-            out.append(tile.half())  # cast back to FP16 if desired
+            tile = (acc_num / acc_den.clamp(min=1e-8)).t().reshape(3, tile_hw, tile_hw)
+            out.append(tile.half())
 
-        return torch.stack(out, 0)  # (num_tiles, 3, tile_hw, tile_hw)
+        return torch.stack(out, 0)
