@@ -1,3 +1,4 @@
+# src/train.py  – Gaussian-Splat training (tile-wise backward, frame-wise step, new torch.amp API)
 import argparse, yaml, torch
 from pathlib import Path
 from PIL import Image
@@ -6,10 +7,12 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from gaussian.init_from_sfm import (
-    read_points3D, read_images, read_cameras, create_gaussian_cloud_from_points
+    read_points3D,
+    read_images,
+    read_cameras,
+    create_gaussian_cloud_from_points
 )
 from render import DifferentiableRenderer
-
 
 class NeRFDataset(Dataset):
     def __init__(self, data_root, images_txt, cameras_txt, image_size):
@@ -31,18 +34,15 @@ class NeRFDataset(Dataset):
     def __getitem__(self, idx):
         p = self.files[idx]
         img = self.tf(Image.open(p).convert("RGB"))
-
         meta = next(
             (m for m in self.images_meta.values() if m["file"] == p.name),
             None
         )
         if meta is None:
             return None
-
         qvec = torch.from_numpy(meta["qvec"]).float()
         tvec = torch.from_numpy(meta["tvec"]).float()
         return img, {"qvec": qvec.unsqueeze(0), "tvec": tvec.unsqueeze(0)}
-
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
@@ -53,7 +53,6 @@ def collate_fn(batch):
     qvecs = torch.cat([p["qvec"] for p in poses], 0)
     tvecs = torch.cat([p["tvec"] for p in poses], 0)
     return imgs, {"qvec": qvecs, "tvec": tvecs}
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -74,7 +73,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Gaussian cloud
+    # prepare Gaussian cloud
     pts = (
         Path(data_cfg["root"])
         / data_cfg["colmap_output_dir"]
@@ -87,10 +86,10 @@ def main():
         scale_variance=gaussian_cfg.get("scale_variance", False)
     ).to(device)
 
-    # Renderer
+    # renderer
     renderer = DifferentiableRenderer(render_cfg["image_size"]).to(device)
 
-    # Dataset + DataLoader
+    # dataset + loader
     ds = NeRFDataset(
         data_cfg["root"],
         Path(data_cfg["root"]) / data_cfg["colmap_output_dir"] / "sparse/0/images.txt",
@@ -102,7 +101,7 @@ def main():
 
     optimizer = torch.optim.Adam(cloud.parameters(),
                                  lr=train_cfg["learning_rate"])
-    scaler    = amp.GradScaler(device_type="cuda")  # <--- NEW API
+    scaler    = amp.GradScaler()  # <--- no args
 
     tile_sz = 64 * 64
     for epoch in range(1, train_cfg["epochs"] + 1):
@@ -113,7 +112,8 @@ def main():
             if batch is None:
                 continue
             imgs, pose = batch
-            imgs = imgs.to(device); pose = {k: v.to(device) for k, v in pose.items()}
+            imgs = imgs.to(device)
+            pose = {k: v.to(device) for k, v in pose.items()}
 
             H, W = render_cfg["image_size"]
             HW   = H * W
@@ -122,16 +122,15 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             for s in starts:
                 e = s + tile_sz
-                # <--- use new torch.amp.autocast
-                with amp.autocast(device_type="cuda", dtype=torch.float16):
+                with amp.autocast(dtype=torch.float16):
                     out = renderer(
                         cloud, pose,
                         tile_hw=64, chunk_gauss=8192,
                         tile_range=(s.item(), e.item())
-                    )  # shape (1,3,64,64)
-                    pred_flat = out.view(1, 3, -1)           # (1,3,P)
+                    )
+                    pred_flat = out.view(1, 3, -1)
                     P = pred_flat.size(-1)
-                    gt_flat   = imgs.view(1, 3, -1)[..., s:s+P]
+                    gt_flat = imgs.view(1, 3, -1)[..., s : s + P]
                     loss = F.mse_loss(pred_flat, gt_flat)
 
                 scaler.scale(loss).backward()
@@ -143,7 +142,6 @@ def main():
 
         avg = total_loss / max(1, steps)
         print(f"Epoch {epoch:03d}/{train_cfg['epochs']}  Loss: {avg:.6f}")
-
 
 if __name__ == "__main__":
     main()
