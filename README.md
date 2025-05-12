@@ -56,6 +56,9 @@ pip install -r requirements.txt
 
 ## 🚀 Training (single GPU or Colab)
 
+
+https://colab.research.google.com/drive/1-FKB89IfXQunT8GlKgti-ktlwxYejFoW#scrollTo=g3fCCwIqtVua
+
 ```bash
 # fresh run
 python src/train.py --cfg configs/gaussian_train.yaml
