@@ -17,8 +17,17 @@ class NeRFDataset(Dataset):
                             if "_depth" not in p.name)
 
         meta_raw = read_images(images_txt)
-        # 파일명 그대로 키로 매핑  (KeyError 방지)
-        self.file2meta = {Path(m['file']).name: m for m in meta_raw.values()}
+
+        # 🔸 두 가지 키로 모두 매핑 (파일명, 숫자 id)  ───────────────
+        self.file2meta = {}
+        self.id2meta   = {}
+        for m in meta_raw.values():
+            fname = Path(m["file"]).name
+            self.file2meta[fname] = m
+            digits = "".join(filter(str.isdigit, Path(fname).stem))
+            if digits:
+                self.id2meta[int(digits)] = m
+        # ---------------------------------------------------------
 
         self.tf = transforms.Compose([
             transforms.Resize(tuple(imsize)),
@@ -29,16 +38,25 @@ class NeRFDataset(Dataset):
 
     def __getitem__(self, idx):
         p = self.paths[idx]
-        m = self.file2meta.get(p.name)
-        if m is None:
-            raise RuntimeError(f"metadata for {p.name} not found")
+        meta = self.file2meta.get(p.name)
+
+        # 🔸 파일명 키가 없으면 숫자 id 로 재시도  ────────────────
+        if meta is None:
+            digits = "".join(filter(str.isdigit, p.stem))
+            if digits:
+                meta = self.id2meta.get(int(digits))
+        # --------------------------------------------------------
+
+        if meta is None:
+            raise RuntimeError(f"[Dataset] metadata for {p.name} not found")
 
         img = self.tf(Image.open(p).convert("RGB"))
         pose = {
-            'qvec': torch.from_numpy(m['qvec']),
-            'tvec': torch.from_numpy(m['tvec'])
+            "qvec": torch.from_numpy(meta["qvec"]),
+            "tvec": torch.from_numpy(meta["tvec"])
         }
         return img, pose
+
 # -----------------------------------------------------
 
 def main():
