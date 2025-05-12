@@ -1,9 +1,11 @@
-# src/train.py  – Gaussian-Splat training (tile-wise backward, frame-wise step)
-import argparse, yaml, torch
+# src/train.py  – Tile-wise backward, frame-wise step training
+import argparse
+import yaml
+import torch
+import torch.nn.functional as F
 from pathlib import Path
 from PIL import Image
 from torch import amp
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from gaussian.init_from_sfm import (
@@ -39,7 +41,7 @@ class NeRFDataset(Dataset):
             None
         )
         if meta is None:
-            return None
+            return None  # skip if no pose
         qvec = torch.from_numpy(meta["qvec"]).float()
         tvec = torch.from_numpy(meta["tvec"]).float()
         return img, {"qvec": qvec.unsqueeze(0), "tvec": tvec.unsqueeze(0)}
@@ -65,7 +67,7 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = yaml.safe_load(open(args.cfg, 'r'))
+    cfg = yaml.safe_load(open(args.cfg, "r"))
     train_cfg    = cfg["train"]
     data_cfg     = cfg["data"]
     gaussian_cfg = cfg["gaussian"]
@@ -73,34 +75,47 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    pts = (
+    # build GaussianPointCloud
+    pts_path = (
         Path(data_cfg["root"])
         / data_cfg["colmap_output_dir"]
         / "sparse/0/points3D.txt"
     )
-    xyz, rgb = read_points3D(pts)
+    xyz, rgb = read_points3D(pts_path)
     cloud = create_gaussian_cloud_from_points(
         (xyz, rgb),
         scale=train_cfg.get("gaussian_scale", 1.0),
         scale_variance=gaussian_cfg.get("scale_variance", False)
     ).to(device)
 
+    # instantiate renderer
     renderer = DifferentiableRenderer(render_cfg["image_size"]).to(device)
+    # renderer = torch.compile(renderer)  # optional speed-up
 
+    # dataset + dataloader
     ds = NeRFDataset(
         data_cfg["root"],
         Path(data_cfg["root"]) / data_cfg["colmap_output_dir"] / "sparse/0/images.txt",
         Path(data_cfg["root"]) / data_cfg["colmap_output_dir"] / "sparse/0/cameras.txt",
         render_cfg["image_size"]
     )
-    dl = DataLoader(ds, batch_size=1, shuffle=True,
-                    num_workers=0, collate_fn=collate_fn)
+    dl = DataLoader(
+        ds,
+        batch_size=2,         # ↑ increase batch
+        shuffle=True,
+        num_workers=4,        # ↑ parallel data loading
+        pin_memory=True,      # ↑ faster host→GPU transfer
+        collate_fn=collate_fn
+    )
 
-    optimizer = torch.optim.Adam(cloud.parameters(),
-                                 lr=train_cfg["learning_rate"])
-    scaler    = amp.GradScaler()  # no device_type
+    optimizer = torch.optim.Adam(cloud.parameters(), lr=train_cfg["learning_rate"])
+    scaler    = amp.GradScaler()  # no args needed
 
-    tile_sz = 64 * 64
+    # performance knobs
+    tile_hw     = 128
+    tile_size   = tile_hw * tile_hw
+    chunk_gauss = 16384
+
     for epoch in range(1, train_cfg["epochs"] + 1):
         total_loss = 0.0
         steps      = 0
@@ -112,23 +127,24 @@ def main():
             imgs = imgs.to(device)
             pose = {k: v.to(device) for k, v in pose.items()}
 
-            H, W   = render_cfg["image_size"]
-            HW     = H * W
-            starts = torch.arange(0, HW - tile_sz + 1, tile_sz, device=device)
+            H, W = render_cfg["image_size"]
+            HW   = H * W
+            starts = torch.arange(0, HW - tile_size + 1, tile_size, device=device)
 
             optimizer.zero_grad(set_to_none=True)
             for s in starts:
-                e = s + tile_sz
+                e = s + tile_size
                 with amp.autocast("cuda", dtype=torch.float16):
                     out = renderer(
                         cloud, pose,
-                        tile_hw=64, chunk_gauss=8192,
+                        tile_hw=tile_hw,
+                        chunk_gauss=chunk_gauss,
                         tile_range=(s.item(), e.item())
                     )
-                    pred_flat = out.view(1, 3, -1)
+                    pred_flat = out.view(imgs.size(0), 3, -1)
                     P         = pred_flat.size(-1)
-                    gt_flat   = imgs.view(1, 3, -1)[..., s : s + P]
-                    loss      = F.mse_loss(pred_flat, gt_flat)
+                    gt_flat   = imgs.view(imgs.size(0), 3, -1)[..., s : s + P]
+                    loss = F.mse_loss(pred_flat, gt_flat)
 
                 scaler.scale(loss).backward()
                 total_loss += loss.item()
