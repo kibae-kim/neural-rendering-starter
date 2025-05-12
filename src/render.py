@@ -1,95 +1,56 @@
-# Differentiable Gaussian‑splat renderer
-# tile 64×64 px, gauss‑chunk 8192, tile‑range 지원 (single‑GPU)
 
-import yaml, torch
-from pathlib import Path
-from torch import nn
-from gaussian.init_from_sfm import read_cameras
-
+# render.py – Differentiable Gaussian Splatting Renderer
+import torch
+import torch.nn as nn
 
 class DifferentiableRenderer(nn.Module):
-    def __init__(self, image_size):
+    def __init__(self, means, covs, colors, image_size, tile_hw, near_plane, far_plane, cameras, device):
         super().__init__()
-        self.H, self.W = image_size
-        self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.means = nn.Parameter(means)    # [N,3]
+        self.covs = nn.Parameter(covs)      # [N,3,3]
+        self.colors = nn.Parameter(colors)  # [N,3]
+        self.image_size = image_size
+        self.tile_hw = tile_hw
+        self.near_plane = near_plane
+        self.far_plane = far_plane
+        self.cameras = cameras
+        self.device = device
 
-        # ── camera intrinsics ────────────────────────────────────────
-        root = Path(__file__).resolve().parents[1]
-        cfg  = yaml.safe_load(open(root / "configs" / "gaussian_train.yaml"))
-        cam_txt = (root / cfg["data"]["root"] /
-                   cfg["data"]["colmap_output_dir"] / "sparse/0/cameras.txt")
-        cam = next(iter(read_cameras(str(cam_txt)).values()))
-        if cam["model"].startswith("SIMPLE_RADIAL"):
-            f, cx, cy = cam["params"][:3]; fx = fy = f
-        else:                              # PINHOLE
-            fx, fy, cx, cy = cam["params"][:4]
-        self.fx = torch.tensor(fx, device=self.dev)
-        self.fy = torch.tensor(fy, device=self.dev)
-        self.cx = torch.tensor(cx, device=self.dev)
-        self.cy = torch.tensor(cy, device=self.dev)
+    def forward(self, image_ids):
+        results = []
+        for img_id in image_ids:
+            cam = self.cameras[img_id]
+            rays_o, rays_d = self._generate_rays(cam)
+            R = rays_o.view(-1, 3)
+            D = rays_d.view(-1, 3)
+            weights = self._compute_gaussian_weights(R, D)  # [R_t, N]
+            rgb = (weights @ self.colors) / (weights.sum(dim=-1, keepdim=True) + 1e-5)  # [R_t,3]
+            rgb = rgb.transpose(0,1).view(3, self.tile_hw*self.tile_hw)
+            results.append(rgb)
+        return torch.stack(results, dim=0)  # [B,3,N_rays]
 
-        xs = torch.arange(self.W, device=self.dev)
-        ys = torch.arange(self.H, device=self.dev)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        self.pix = torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)  # (HW,2)
+    def _generate_rays(self, cam):
+        fx, fy, cx, cy = cam['intrinsics']
+        c2w = torch.tensor(cam['extrinsics'], device=self.device, dtype=torch.float32)
+        H = W = self.tile_hw
+        i, j = torch.meshgrid(
+            torch.arange(W, device=self.device),
+            torch.arange(H, device=self.device),
+            indexing='xy'
+        )
+        dirs = torch.stack([(i - cx) / fx, -(j - cy) / fy, -torch.ones_like(i)], dim=-1)
+        # Rotate rays
+        rays_d = (dirs[..., None, :] @ c2w[:3, :3].T).squeeze(-2)
+        rays_o = c2w[:3, 3].expand(rays_d.shape)
+        return rays_o, rays_d
 
-    # --------------------------------------------------------------
-    @staticmethod
-    def quat2mat(q):
-        q = q / q.norm(); w, x, y, z = q
-        return torch.tensor([
-            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
-            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
-            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
-        ], dtype=q.dtype, device=q.device)
-
-    # --------------------------------------------------------------
-    def forward(self, cloud, pose,
-                tile_hw: int = 64,
-                chunk_gauss: int = 8192,
-                tile_range: tuple | None = None):
-        """단일 이미지(batch=1)를 전제로 타일 또는 전체를 렌더."""
-        pos = cloud.positions.to(self.dev, torch.float16)
-        col = cloud.colors.to(self.dev,   torch.float16)
-        opa = cloud.opacities.to(self.dev, torch.float16)
-        sc  = cloud.scales.to(self.dev,   torch.float16)
-
-        q = pose["qvec"][0].to(self.dev)
-        t = pose["tvec"][0].to(self.dev)
-        R = self.quat2mat(q)
-
-        proj = (R @ pos.t()).t().float() + t.unsqueeze(0)
-        proj = torch.stack([(proj[:,0]/proj[:,2])*self.fx + self.cx,
-                            (proj[:,1]/proj[:,2])*self.fy + self.cy], 1)
-
-        step = tile_hw * tile_hw
-        HW   = self.H * self.W
-        if tile_range is None:
-            starts = torch.arange(0, HW - step + 1, step, device=self.dev)
-        else:
-            starts = torch.tensor([tile_range[0]], device=self.dev)
-
-        outputs = []
-        for start in starts:
-            coords = self.pix[start:start+step]                        # (T,2)
-
-            acc_num = torch.zeros(step, 3, dtype=torch.float16, device=self.dev)
-            acc_den = torch.zeros(step, 1, dtype=torch.float16, device=self.dev)
-
-            for g0 in range(0, pos.size(0), chunk_gauss):
-                g1 = min(g0 + chunk_gauss, pos.size(0))
-                pj = proj[g0:g1]; cl = col[g0:g1]; op = opa[g0:g1]
-                var = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)
-
-                diff  = (coords.unsqueeze(0) - pj.unsqueeze(1)).half()
-                dist2 = (diff**2).sum(-1).float()
-                w     = op * torch.exp(-0.5 * dist2 / var)             # (g,T)
-
-                num = (w.unsqueeze(-1) * cl.unsqueeze(1)).sum(0)
-                den = w.sum(0).unsqueeze(-1) + 1e-8
-                acc_num += num.half(); acc_den += den.half()
-
-            tile = (acc_num / acc_den).t().reshape(3, tile_hw, tile_hw)
-            outputs.append(tile)
-
-        return torch.stack(outputs, 0)  # (#tiles or 1, 3, 64, 64)
+    def _compute_gaussian_weights(self, rays_o, rays_d):
+        diff = self.means.unsqueeze(0) - rays_o.unsqueeze(1)  # [R,N,3]
+        t = (diff * rays_d.unsqueeze(1)).sum(-1, keepdim=True)   # [R,N,1]
+        closest = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * t  # [R,N,3]
+        pdiff = self.means.unsqueeze(0) - closest
+        sigma = torch.sqrt(torch.mean(torch.diagonal(self.covs, dim1=1, dim2=2), dim=1))  # [N]
+        sigma = sigma.unsqueeze(0)  # [1,N]
+        dist2 = (pdiff ** 2).sum(-1)  # [R,N]
+        weights = torch.exp(-0.5 * dist2 / (sigma**2 + 1e-5))
+        return weights
