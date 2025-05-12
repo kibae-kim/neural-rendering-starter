@@ -1,59 +1,123 @@
-# render.py – Differentiable Gaussian Splatting Renderer
-import torch
-import torch.nn as nn
-
+import yaml, torch
+from pathlib import Path
+from torch import nn
+from gaussian.init_from_sfm import read_cameras
 
 class DifferentiableRenderer(nn.Module):
-    def __init__(self, means, covs, colors,
-                 image_size, tile_hw,
-                 near_plane, far_plane,
-                 cameras, device):
+    def __init__(self, image_size):
         super().__init__()
-        self.means      = nn.Parameter(means)    # [N,3]
-        self.covs       = nn.Parameter(covs)     # [N,3,3]
-        self.colors     = nn.Parameter(colors)   # [N,3]
-        self.image_size = image_size
-        self.tile_hw    = tile_hw
-        self.near_plane = near_plane
-        self.far_plane  = far_plane
-        self.cameras    = cameras
-        self.device     = device
+        self.H, self.W = image_size
+        self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    def forward(self, image_ids):
-        results = []
-        for img_id in image_ids:
-            cam       = self.cameras[img_id]
-            rays_o, rays_d = self._generate_rays(cam)
-            R = rays_o.view(-1, 3)
-            D = rays_d.view(-1, 3)
-            weights = self._compute_gaussian_weights(R, D)  # [R_t, N]
-            rgb = (weights @ self.colors) / (weights.sum(dim=-1, keepdim=True) + 1e-5)
-            rgb = rgb.transpose(0, 1).view(3, self.tile_hw * self.tile_hw)
-            results.append(rgb)
-        return torch.stack(results, dim=0)  # [B,3,N_rays]
+        # ── Load intrinsics from configs/gaussian_train.yaml ───────────────
+        repo = Path(__file__).resolve().parents[1]
+        cfg  = yaml.safe_load(open(repo / "configs" / "gaussian_train.yaml"))
 
-    def _generate_rays(self, cam):
-        fx, fy, cx, cy = cam['intrinsics']
-        c2w           = torch.tensor(cam['extrinsics'], device=self.device, dtype=torch.float32)
-        H = W         = self.tile_hw
-        i, j = torch.meshgrid(
-            torch.arange(W, device=self.device),
-            torch.arange(H, device=self.device),
-            indexing='xy'
+        camfile = (
+            repo
+            / cfg["data"]["root"]
+            / cfg["data"]["colmap_output_dir"]
+            / "sparse/0/cameras.txt"
         )
-        dirs = torch.stack([(i - cx) / fx, -(j - cy) / fy, -torch.ones_like(i)], dim=-1)
-        # Rotate rays
-        rays_d = (dirs[..., None, :] @ c2w[:3, :3].T).squeeze(-2)
-        rays_o = c2w[:3, 3].expand(rays_d.shape)
-        return rays_o, rays_d
+        cam0 = next(iter(read_cameras(str(camfile)).values()))
 
-    def _compute_gaussian_weights(self, rays_o, rays_d):
-        diff    = self.means.unsqueeze(0) - rays_o.unsqueeze(1)      # [R,N,3]
-        t       = (diff * rays_d.unsqueeze(1)).sum(-1, keepdim=True) # [R,N,1]
-        closest = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * t      # [R,N,3]
-        pdiff   = self.means.unsqueeze(0) - closest
-        sigma   = torch.sqrt(torch.mean(torch.diagonal(self.covs, dim1=1, dim2=2), dim=1))
-        sigma   = sigma.unsqueeze(0)  # [1,N]
-        dist2   = (pdiff ** 2).sum(-1) # [R,N]
-        weights = torch.exp(-0.5 * dist2 / (sigma**2 + 1e-5))
-        return weights
+        if cam0["model"].startswith("SIMPLE_RADIAL"):
+            f, cx, cy = cam0["params"][:3]
+            fx = fy = f
+        else:  # PINHOLE
+            fx, fy, cx, cy = cam0["params"][:4]
+
+        # store as tensors
+        self.fx = torch.tensor(fx, device=self.dev, dtype=torch.float32)
+        self.fy = torch.tensor(fy, device=self.dev, dtype=torch.float32)
+        self.cx = torch.tensor(cx, device=self.dev, dtype=torch.float32)
+        self.cy = torch.tensor(cy, device=self.dev, dtype=torch.float32)
+
+        # precompute pixel grid
+        xs = torch.arange(self.W, device=self.dev, dtype=torch.float32)
+        ys = torch.arange(self.H, device=self.dev, dtype=torch.float32)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        self.pix = torch.stack([xx.reshape(-1), yy.reshape(-1)], dim=1)  # (HW,2)
+
+    @staticmethod
+    def quat2mat(q):
+        q = q / q.norm()
+        w, x, y, z = q
+        return torch.tensor([
+            [1-2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1-2*(x*x+z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)]
+        ], dtype=q.dtype, device=q.device)
+
+    def forward(self, cloud, pose,
+                tile_hw: int = 64,
+                chunk_gauss: int = 8192,
+                tile_range: tuple | None = None):
+        """
+        Render one batch (assumed batch_size=1) in tiles:
+        - tile_hw: size of each square tile (px)
+        - chunk_gauss: how many gaussians to process at once
+        - tile_range: (start, end) linear pixel indices to render one tile;
+                      if None, renders all non-overlapping tiles in row-major order.
+        Returns a tensor of shape (#tiles, 3, tile_hw, tile_hw)
+        """
+        # move cloud to FP16 for positions/colors/opacities/scales
+        pos = cloud.positions.to(self.dev, torch.float16)   # (N,3)
+        col = cloud.colors   .to(self.dev, torch.float16)   # (N,3)
+        opa = cloud.opacities.to(self.dev, torch.float16)   # (N,1)
+        sc  = cloud.scales   .to(self.dev, torch.float16)   # (N,1)
+
+        # single-image batch assumed
+        q = pose["qvec"][0].to(self.dev)   # (4,)
+        t = pose["tvec"][0].to(self.dev)   # (3,)
+        R = self.quat2mat(q)               # (3,3)
+
+        # project once
+        p_cam = (R @ pos.t()).t().float() + t.unsqueeze(0)  # (N,3) in FP32
+        proj = torch.stack([
+            (p_cam[:,0]/p_cam[:,2]) * self.fx + self.cx,
+            (p_cam[:,1]/p_cam[:,2]) * self.fy + self.cy
+        ], dim=1)  # (N,2)
+
+        HW   = self.H * self.W
+        step = tile_hw * tile_hw
+        if tile_range is None:
+            starts = torch.arange(0, HW - step + 1, step, device=self.dev)
+        else:
+            starts = torch.tensor([tile_range[0]], device=self.dev)
+
+        out = []
+        for s in starts:
+            coords = self.pix[s : s + step]                     # (step,2)
+
+            # **ACCUMULATE IN FP32** to avoid nan
+            acc_num = torch.zeros(step, 3, dtype=torch.float32, device=self.dev)
+            acc_den = torch.zeros(step, 1, dtype=torch.float32, device=self.dev)
+
+            # gaussian chunks
+            N = pos.shape[0]
+            for g0 in range(0, N, chunk_gauss):
+                g1 = min(g0 + chunk_gauss, N)
+                pj = proj[g0:g1]       # (g,2)
+                cl = col[g0:g1]        # (g,3)
+                op = opa[g0:g1]        # (g,1)
+                var = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)  # (g,1)
+
+                # compute weights
+                diff  = (coords.unsqueeze(0) - pj.unsqueeze(1)).half()  # (g,step,2)
+                dist2 = (diff**2).sum(-1).float()                       # (g,step)
+                w     = op * torch.exp(-0.5 * dist2 / var)             # (g,step)
+
+                num = (w.unsqueeze(-1) * cl.unsqueeze(1)).sum(0).float()  # (step,3)
+                den = (w.sum(0).unsqueeze(-1)).float() + 1e-8            # (step,1)
+
+                acc_num += num
+                acc_den += den
+
+            # tile in FP32, then reshape
+            tile = (acc_num / acc_den.clamp(min=1e-8)) \
+                        .t() \
+                        .reshape(3, tile_hw, tile_hw)
+            out.append(tile.half())  # cast back to FP16 if desired
+
+        return torch.stack(out, 0)  # (num_tiles, 3, tile_hw, tile_hw)
