@@ -1,4 +1,6 @@
-# Differentiable 2‑D splat renderer (ultra‑low‑mem)
+# Differentiable Gaussian‑splat renderer
+#  (tile 32×32 px, chunk 4096 gaussians, tile‑range 지원)
+
 import torch, yaml
 from pathlib import Path
 from torch import nn
@@ -9,86 +11,81 @@ class DifferentiableRenderer(nn.Module):
     def __init__(self, image_size):
         super().__init__()
         self.H, self.W = image_size
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # ── intrinsics ──────────────────────────────────────────
+        # ── intrinsics ────────────────────────────────────────────────
         root = Path(__file__).resolve().parents[1]
         cfg  = yaml.safe_load(open(root / "configs" / "gaussian_train.yaml"))
         cam0 = next(iter(read_cameras(str(
             root / cfg["data"]["root"] /
-            cfg["data"]["colmap_output_dir"] / "sparse/0/cameras.txt"
-        )).values()))
+            cfg["data"]["colmap_output_dir"] / "sparse/0/cameras.txt")).values()))
         if cam0["model"].startswith("SIMPLE_RADIAL"):
             f, cx, cy = cam0["params"][:3]; fx = fy = f
-        else:                                  # PINHOLE 외 형식 생략
-            fx, fy, cx, cy = cam0["params"][:4]
-        self.fx, self.fy = map(lambda v: torch.tensor(v, device=self.device), (fx, fy))
-        self.cx, self.cy = map(lambda v: torch.tensor(v, device=self.device), (cx, cy))
+        else:  fx, fy, cx, cy = cam0["params"][:4]
 
-        xs = torch.arange(self.W, device=self.device); ys = torch.arange(self.H, device=self.device)
+        self.fx = torch.tensor(fx, device=self.dev); self.fy = torch.tensor(fy, device=self.dev)
+        self.cx = torch.tensor(cx, device=self.dev); self.cy = torch.tensor(cy, device=self.dev)
+
+        xs = torch.arange(self.W, device=self.dev); ys = torch.arange(self.H, device=self.dev)
         yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        self.pixel_coords = torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)  # (HW,2)
+        self.pix = torch.stack([xx.reshape(-1), yy.reshape(-1)], 1)      # (HW,2)
 
-    # ----------------------------------------------------------
+    # --------------------------------------------------------------
     @staticmethod
     def quat2mat(q):
-        q = q / q.norm(); w, x, y, z = q
-        return torch.stack([
-            torch.tensor([1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)]),
-            torch.tensor([2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)]),
-            torch.tensor([2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)])
-        ], 0).to(q)
+        q = q / q.norm(); w,x,y,z = q
+        return torch.tensor([
+            [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+            [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+            [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]], dtype=q.dtype, device=q.device)
 
-    # ----------------------------------------------------------
+    # --------------------------------------------------------------
     def forward(self, cloud, pose,
-                tile_hw=8,
-                chunk_gauss=256,            # CHANGED  더 작은 청크
-                tile_range=None):           # NEW  (start,end) 만 렌더
-        pos = cloud.positions.to(self.device, torch.float16)
-        col = cloud.colors.to(self.device,   torch.float16)
-        opa = cloud.opacities.to(self.device,torch.float16)
-        sc  = cloud.scales.to(self.device,   torch.float16)
-        qv  = pose["qvec"].to(self.device); tv = pose["tvec"].to(self.device)
+                tile_hw: int = 32,          # 32×32px
+                chunk_gauss: int = 4096,    # 4 k gauss
+                tile_range: tuple | None = None):
 
-        B, N, HW = qv.shape[0], pos.shape[0], self.H*self.W
+        pos = cloud.positions.to(self.dev, torch.float16)
+        col = cloud.colors.to(self.dev,   torch.float16)
+        opa = cloud.opacities.to(self.dev,torch.float16)
+        sc  = cloud.scales.to(self.dev,   torch.float16)
+        qv  = pose["qvec"].to(self.dev);  tv = pose["tvec"].to(self.dev)
+
+        HW = self.H * self.W
+        step = tile_hw * tile_hw
         if tile_range is None:
-            tiles = torch.arange(0, HW, tile_hw*tile_hw, device=self.device)
-        else:  # 단일 타일 전용
-            #tiles = torch.tensor(tile_range, device=self.device)
-            tiles = torch.arange(tile_range[0], tile_range[1],
-                                tile_hw*tile_hw, device=self.device)
-            
+            tiles = torch.arange(0, HW - step + 1, step, device=self.dev)
+        else:
+            tiles = torch.arange(tile_range[0], tile_range[1], step, device=self.dev)
 
-        rendered = []
-        for b in range(B):
+        out_tiles = []
+        for b in range(qv.shape[0]):
             R = self.quat2mat(qv[b]); t = tv[b].unsqueeze(0)
             proj = (R @ pos.t()).t().float() + t
             proj = torch.stack([(proj[:,0]/proj[:,2])*self.fx + self.cx,
                                 (proj[:,1]/proj[:,2])*self.fy + self.cy], 1)
 
-            img_acc = torch.zeros(len(tiles)*tile_hw*tile_hw, 3,
-                                  device=self.device, dtype=torch.float16)
-            w_acc   = torch.zeros_like(img_acc[..., :1])
+            for start in tiles:
+                end = start + step                                    # 항상 32² 픽셀
+                coords = self.pix[start:end]                          # (1024,2)
 
-            for g0 in range(0, N, chunk_gauss):
-                g1 = min(g0+chunk_gauss, N)
-                proj_g, col_g, opa_g = proj[g0:g1], col[g0:g1], opa[g0:g1]
-                var_g = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)
+                img_acc = w_acc = 0.                                  # reset per‑tile
 
-                for i, start in enumerate(tiles):
-                    end = min(start + tile_hw*tile_hw, HW)
-                    coords = self.pixel_coords[start:end]
+                for g0 in range(0, pos.size(0), chunk_gauss):
+                    g1 = min(g0+chunk_gauss, pos.size(0))
+                    pj = proj[g0:g1]; cl = col[g0:g1]; op = opa[g0:g1]
+                    var = (sc[g0:g1].squeeze(-1)**2).unsqueeze(1)
 
-                    diff  = (coords.unsqueeze(0) - proj_g.unsqueeze(1)).half()
+                    diff  = (coords.unsqueeze(0) - pj.unsqueeze(1)).half()
                     dist2 = (diff**2).sum(-1).float()
-                    w     = opa_g * torch.exp(-0.5*dist2 / var_g)
+                    w     = op * torch.exp(-0.5*dist2 / var)          # (g,T)
 
-                    num = (w.unsqueeze(-1) * col_g.unsqueeze(1)).sum(0)
+                    num = (w.unsqueeze(-1)*cl.unsqueeze(1)).sum(0)    # (T,3)
                     den = w.sum(0).unsqueeze(-1) + 1e-8
-                    img_acc[i*tile_hw*tile_hw:(i+1)*tile_hw*tile_hw] += num
-                    w_acc[i*tile_hw*tile_hw:(i+1)*tile_hw*tile_hw]  += den
+                    img_acc += num
+                    w_acc   += den
 
-            img = (img_acc / w_acc.clamp(min=1e-8)).t().reshape(3, len(tiles)*tile_hw, tile_hw)
-            rendered.append(img[:, :self.H, :self.W])     # 안전 절삭
+                tile = (img_acc / w_acc).t().reshape(3, tile_hw, tile_hw)  # (3,32,32)
+                out_tiles.append(tile)
 
-        return torch.stack(rendered, 0)  # (B,3,H,W)
+        return torch.stack(out_tiles, 0)     # (#tiles,3,32,32)
